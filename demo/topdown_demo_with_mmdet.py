@@ -5,7 +5,10 @@ import os
 import time
 from argparse import ArgumentParser
 
+import pyrealsense2 as rs
 import cv2
+from pupil_apriltags import Detector
+from PIL import Image
 import json_tricks as json
 import mmcv
 import mmengine
@@ -25,6 +28,50 @@ try:
 except (ImportError, ModuleNotFoundError):
     has_mmdet = False
 
+
+def init_camera():
+
+    print("starting reset")
+    ctx = rs.context()
+    devices = ctx.query_devices()
+    for dev in devices:
+        dev.hardware_reset()
+    print("reset done")
+    
+    # Configure depth and color streams
+    pipeline = rs.pipeline()
+    config = rs.config()
+    
+    # Get device product line for setting a supporting resolution
+    pipeline_wrapper = rs.pipeline_wrapper(pipeline)
+    pipeline_profile = config.resolve(pipeline_wrapper)
+    device = pipeline_profile.get_device()
+    device_product_line = str(device.get_info(rs.camera_info.product_line))
+    
+    found_rgb = False
+    for s in device.sensors:
+        if s.get_info(rs.camera_info.name) == 'RGB Camera':
+            found_rgb = True
+            break
+    if not found_rgb:
+        print("The demo requires Depth camera with Color sensor")
+        exit(0)
+    
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    
+    if device_product_line == 'L500':
+        config.enable_stream(rs.stream.color, 960, 540, rs.format.bgr8, 30)
+    else:
+        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    
+    # Start streaming
+    profile = pipeline.start(config)
+
+    # Create an align object
+    align_to = rs.stream.color
+    align = rs.align(align_to)
+
+    return pipeline, align, profile
 
 def process_one_image(args,
                       img,
@@ -95,7 +142,7 @@ def main():
         help='root of the output img file. '
         'Default not saving the visualization images.')
     parser.add_argument(
-        '--save-predictions',
+        '--save_predictions',
         action='store_true',
         default=False,
         help='whether to save predicted results')
@@ -220,7 +267,8 @@ def main():
     elif input_type in ['webcam', 'video']:
 
         if args.input == 'webcam':
-            cap = cv2.VideoCapture(0)
+            pipeline, align, profile = init_camera()
+            # cap = cv2.VideoCapture(8)
         else:
             cap = cv2.VideoCapture(args.input)
 
@@ -228,52 +276,92 @@ def main():
         pred_instances_list = []
         frame_idx = 0
 
-        while cap.isOpened():
-            success, frame = cap.read()
-            frame_idx += 1
+        ##while cap.isOpened():
+        while True:
+            try:
+                # Wait for a coherent pair of frames: depth and color
+                frames = pipeline.wait_for_frames()
+                #depth_frame = frames.get_depth_frame()
+                aligned_frames = align.process(frames)
+                aligned_depth_frame = aligned_frames.get_depth_frame()
+                #color_frame = frames.get_color_frame()
+                aligned_color_frame = aligned_frames.get_color_frame()
+                ##success, frame = cap.read()
+                #if not depth_frame or not color_frame:
+                #    continue
+                depth_image = np.asanyarray(aligned_depth_frame.get_data())
+                color_image = np.asanyarray(aligned_color_frame.get_data())
 
-            if not success:
-                break
+                frame_idx += 1
 
-            # topdown pose estimation
-            pred_instances = process_one_image(args, frame, detector,
-                                               pose_estimator, visualizer,
-                                               0.001)
 
-            if args.save_predictions:
-                # save prediction results
-                pred_instances_list.append(
-                    dict(
-                        frame_id=frame_idx,
-                        instances=split_instances(pred_instances)))
+                #at_detector = Detector(families="tag36h11", nthreads=1, quad_decimate=1.0, quad_sigma=0.0, refine_edges=1, decode_sharpening=0.25, debug=0)
+                #print("shape = ",mmcv.rgb2gray(visualizer.get_image()))
+                #image = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+                #detections = at_detector.detect(image)
+                #print("detections = ", detections)
+                depth_intrin = aligned_depth_frame.profile.as_video_stream_profile().intrinsics
 
-            # output videos
-            if output_file:
-                frame_vis = visualizer.get_image()
 
-                if video_writer is None:
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    # the size of the image with visualization may vary
-                    # depending on the presence of heatmaps
-                    video_writer = cv2.VideoWriter(
-                        output_file,
-                        fourcc,
-                        25,  # saved fps
-                        (frame_vis.shape[1], frame_vis.shape[0]))
+                ##if not success:
+                ##    break
 
-                video_writer.write(mmcv.rgb2bgr(frame_vis))
+                # topdown pose estimation
+                ##pred_instances = process_one_image(args, frame, detector,
+                ##                                  pose_estimator, visualizer,
+                ##                                   0.001)
+                pred_instances = process_one_image(args, color_image, detector,
+                                                  pose_estimator, visualizer,
+                                                   0.001)
 
-            if args.show:
-                # press ESC to exit
-                if cv2.waitKey(5) & 0xFF == 27:
-                    break
+                if args.save_predictions:
+                    # save prediction results
+                    pred_instances_list.append(
+                        dict(
+                            frame_id=frame_idx,
+                            instances=split_instances(pred_instances)))
 
-                time.sleep(args.show_interval)
+                    print( split_instances(pred_instances)[0]["keypoints"][8] )
+                    index_finger_tip = split_instances(pred_instances)[0]["keypoints"][8]
+                    depth1 = aligned_depth_frame.get_distance( int(index_finger_tip[1]),int(index_finger_tip[0]) )
+                    depth2 = depth_image[int(index_finger_tip[1]),int(index_finger_tip[0])]
+                    print("depth1", depth1)
+                    print("depth2 at index_finger_tip = ", depth_image[int(index_finger_tip[1]),int(index_finger_tip[0])])
+                    depth_point_in_meters_camera_coords = rs.rs2_deproject_pixel_to_point(depth_intrin, [int(index_finger_tip[0]),int(index_finger_tip[1])], depth2/1000)
+                    print("camera coord = ", depth_point_in_meters_camera_coords)
+
+                # output videos
+                if output_file:
+                    frame_vis = visualizer.get_image()
+
+                    if video_writer is None:
+                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                        # the size of the image with visualization may vary
+                        # depending on the presence of heatmaps
+                        video_writer = cv2.VideoWriter(
+                            output_file,
+                            fourcc,
+                            25,  # saved fps
+                            (frame_vis.shape[1], frame_vis.shape[0]))
+
+                    video_writer.write(mmcv.rgb2bgr(frame_vis))
+
+                if args.show:
+                    # press ESC to exit
+                    if cv2.waitKey(5) & 0xFF == 27:
+                        break
+
+                    time.sleep(args.show_interval)
+            
+            except RuntimeError as e:
+                if e.args[0] == 'RuntimeError: out of range value for argument "y"':
+                    continue
 
         if video_writer:
             video_writer.release()
 
         cap.release()
+        pipeline.stop()
 
     else:
         args.save_predictions = False
